@@ -18,6 +18,16 @@ npm run build
 npm run preview
 ```
 
+## 공유 배포
+
+GitHub Pages로 배포하면 다른 사람은 설치 없이 링크로 실행할 수 있습니다.
+
+1. GitHub 저장소의 `Settings > Pages`에서 `Build and deployment` 소스를 `GitHub Actions`로 설정합니다.
+2. `main` 브랜치에 push하면 `.github/workflows/deploy-pages.yml`가 자동으로 빌드/배포합니다.
+3. 배포 주소는 보통 `https://jh4334.github.io/ansim-photo-studio/` 형식입니다.
+
+권장 브라우저는 Chrome 또는 Edge입니다. `PNG 폴더 저장`은 브라우저의 폴더 선택 기능을 사용하므로, 사용자가 직접 저장할 폴더를 선택할 수 있습니다.
+
 ## 개인정보 보호
 
 - 사진은 서버에 업로드하지 않습니다.

@@ -64,6 +64,19 @@ type SaveFileHandle = {
 
 type SavePickerResult = SaveFileHandle | 'cancelled' | null;
 
+type SelectedSaveFolder = {
+  path: string;
+  name: string;
+  handle?: SaveDirectoryHandle;
+};
+
+type SaveDirectoryHandle = {
+  name?: string;
+  getFileHandle: (fileName: string, options?: { create?: boolean }) => Promise<SaveFileHandle>;
+};
+
+type DirectoryPickerResult = SelectedSaveFolder | 'cancelled' | null;
+
 type SaveOutcome = {
   mode: 'picker' | 'local' | 'browser';
   path?: string;
@@ -75,9 +88,10 @@ type EditInteraction =
   | { kind: 'move'; id: string; start: Point; originalBox: FaceBox; originalBoxes: FaceBox[] }
   | { kind: 'resize'; id: string; handle: ResizeHandle; start: Point; originalBox: FaceBox; originalBoxes: FaceBox[] };
 
-const WASM_PATH = '/models/wasm';
-const SHORT_RANGE_MODEL = '/models/blaze_face_short_range.tflite';
-const FULL_RANGE_MODEL = '/models/blaze_face_full_range.tflite';
+const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path}`.replace(/\/{2,}/g, '/');
+const WASM_PATH = assetPath('models/wasm');
+const SHORT_RANGE_MODEL = assetPath('models/blaze_face_short_range.tflite');
+const FULL_RANGE_MODEL = assetPath('models/blaze_face_full_range.tflite');
 const MIN_BOX_SIZE = 16;
 const LARGE_TOTAL_BYTES = 180 * 1024 * 1024;
 const LARGE_SINGLE_BYTES = 35 * 1024 * 1024;
@@ -100,12 +114,6 @@ function formatBytes(bytes: number) {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
-}
-
-function getFileTimestamp() {
-  const now = new Date();
-  const pad = (value: number) => String(value).padStart(2, '0');
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
 }
 
 function expandBox(box: FaceBox, imageWidth: number, imageHeight: number, ratio = 0.18): FaceBox {
@@ -954,12 +962,56 @@ function App() {
     }
   }
 
-  async function saveViaLocalServer(blob: Blob, fileName: string, folderName?: string) {
+  async function pickSaveFolder(): Promise<DirectoryPickerResult> {
+    const browserPicker = (window as Window & {
+      showDirectoryPicker?: (options?: { id?: string; mode?: 'read' | 'readwrite' }) => Promise<SaveDirectoryHandle>;
+    }).showDirectoryPicker;
+
+    if (browserPicker) {
+      try {
+        const handle = await browserPicker({ id: 'ansim-photo-studio-png', mode: 'readwrite' });
+        return { handle, path: '', name: handle.name || '선택한 폴더' };
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled';
+        throw error;
+      }
+    }
+
+    if (!['localhost', '127.0.0.1'].includes(window.location.hostname)) return null;
+
+    const response = await fetch('/__ansim_pick_folder', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result.message || '폴더 선택 창을 열지 못했습니다.');
+    }
+    if (result.cancelled) return 'cancelled';
+    if (!result.path) return null;
+
+    return {
+      path: String(result.path),
+      name: String(result.name || result.path)
+    };
+  }
+
+  async function saveBlobToDirectory(folder: SelectedSaveFolder, blob: Blob, fileName: string) {
+    if (folder.handle) {
+      const fileHandle = await folder.handle.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return '';
+    }
+
+    return saveViaLocalServer(blob, fileName, undefined, folder.path);
+  }
+
+  async function saveViaLocalServer(blob: Blob, fileName: string, folderName?: string, outputDir?: string) {
     const headers: Record<string, string> = {
       'content-type': 'application/octet-stream',
       'x-ansim-filename': encodeURIComponent(fileName)
     };
     if (folderName) headers['x-ansim-folder'] = encodeURIComponent(folderName);
+    if (outputDir) headers['x-ansim-output-dir'] = encodeURIComponent(outputDir);
 
     const response = await fetch('/__ansim_save', {
       method: 'POST',
@@ -1032,17 +1084,27 @@ function App() {
     }
 
     const exportPhotos = photos;
-    const folderName = `안심사진관_${getFileTimestamp()}`;
+    setStatus('PNG를 저장할 폴더를 선택하세요.');
+
+    const directoryHandle = await pickSaveFolder();
+    if (directoryHandle === 'cancelled') {
+      setStatus('PNG 폴더 저장을 취소했습니다.');
+      return;
+    }
+    if (!directoryHandle) {
+      setStatus('폴더 선택 결과를 확인하지 못했습니다. 다시 시도해 주세요.');
+      return;
+    }
+    const selectedFolderName = directoryHandle.name ? `"${directoryHandle.name}"` : '선택한 폴더';
 
     folderSaveCancelRef.current = false;
     setIsSavingFolder(true);
     setReadyDownload(null);
     setOperationProgress(`PNG 폴더 저장 준비 중 0/${exportPhotos.length}`);
-    setStatus(`작업 목록의 모든 사진을 PNG로 저장하는 중입니다. 저장 폴더: Downloads\\안심사진관\\${folderName}`);
+    setStatus(`작업 목록의 모든 사진을 ${selectedFolderName}에 저장하는 중입니다.`);
     try {
       const snapshotBoxesByPhoto = currentPhotoId ? { ...boxesByPhoto, [currentPhotoId]: boxes } : boxesByPhoto;
       let savedCount = 0;
-      let lastPath = '';
 
       for (const [index, photo] of exportPhotos.entries()) {
         if (folderSaveCancelRef.current) {
@@ -1054,10 +1116,10 @@ function App() {
         const canvas = drawMaskedCanvas(image, snapshotBoxesByPhoto[photo.id] ?? [], maskMode, strength);
         if (!canvas) continue;
         const bytes = await canvasToPngBytes(canvas);
-        lastPath = await saveViaLocalServer(
+        await saveBlobToDirectory(
+          directoryHandle,
           new Blob([bytesToArrayBuffer(bytes)], { type: 'image/png' }),
-          `안심사진관_${String(index + 1).padStart(3, '0')}_${safeBaseName(photo.name)}.png`,
-          folderName
+          `안심사진관_${String(index + 1).padStart(3, '0')}_${safeBaseName(photo.name)}.png`
         );
         savedCount += 1;
       }
@@ -1067,8 +1129,7 @@ function App() {
         return;
       }
 
-      const folderPath = lastPath ? lastPath.replace(/\\[^\\]+$/, '') : `C:\\Users\\USER\\Downloads\\안심사진관\\${folderName}`;
-      setStatus(`${savedCount}장의 처리 결과 PNG를 폴더에 저장했습니다: ${folderPath}`);
+      setStatus(`${savedCount}장의 처리 결과 PNG를 ${selectedFolderName}에 저장했습니다.`);
     } catch (error) {
       setStatus(`PNG 폴더 저장을 완료하지 못했습니다. ${error instanceof Error ? error.message : ''}`);
     } finally {
