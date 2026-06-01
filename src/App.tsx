@@ -557,7 +557,7 @@ function App() {
     loadPhoto(photo, nextBoxesByPhoto);
   }
 
-  async function runFaceDetection(applyBlurImmediately = false) {
+  async function runFaceDetection() {
     const image = imageRef.current;
     if (!image) {
       setStatus('먼저 사진을 선택해 주세요.');
@@ -597,27 +597,13 @@ function App() {
       }
 
       const detectedBoxes = mergeBoxes(detected).map((box) => ({ ...box, shape: 'rect' as const }));
-      if (applyBlurImmediately) {
-        const blurBoxes = detectedBoxes.map((box) => ({ ...box, maskMode: 'blur' as const }));
-        const manualBoxes = boxes.filter((box) => box.source === 'manual');
-        const merged = mergeBoxes([...blurBoxes, ...manualBoxes]);
-        setMaskMode('blur');
-        applyBoxes(
-          merged,
-          detectedBoxes.length > 0
-            ? `자동 감지한 ${detectedBoxes.length}개 영역을 블러 가림으로 바로 적용했습니다. 누락된 얼굴은 수동으로 추가하세요.`
-            : '자동 감지된 얼굴이 없습니다. 민감 프리셋을 선택하거나 수동 영역 추가를 사용하세요.',
-          ''
-        );
-      } else {
-        setPendingAutoBoxes(detectedBoxes);
-        setStatus(
-          detectedBoxes.length > 0
-            ? `자동 감지 후보 ${detectedBoxes.length}개를 찾았습니다. 박스를 확인한 뒤 감지 결과 적용을 눌러 주세요.`
-            : '자동 감지된 얼굴이 없습니다. 민감 프리셋을 선택하거나 수동 영역 추가를 사용하세요.'
-        );
-      }
+      setPendingAutoBoxes(detectedBoxes);
       setOperationProgress('');
+      setStatus(
+        detectedBoxes.length > 0
+          ? `자동 감지 후보 ${detectedBoxes.length}개를 찾았습니다. 박스를 확인한 뒤 감지 결과 적용을 눌러 주세요.`
+          : '자동 감지된 얼굴이 없습니다. 민감 프리셋을 선택하거나 수동 영역 추가를 사용하세요.'
+      );
     } catch (error) {
       setStatus(`얼굴 감지를 실행하지 못했습니다. 모델 파일 위치를 확인해 주세요. ${error instanceof Error ? error.message : ''}`);
     } finally {
@@ -976,10 +962,6 @@ function App() {
     }
   }
 
-  function runFaceDetectionAndBlur() {
-    void runFaceDetection(true);
-  }
-
   async function pickSaveFolder(): Promise<DirectoryPickerResult> {
     const browserPicker = (window as Window & {
       showDirectoryPicker?: (options?: { id?: string; mode?: 'read' | 'readwrite' }) => Promise<SaveDirectoryHandle>;
@@ -1320,20 +1302,11 @@ function App() {
             <button
               className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 text-sm font-black text-white disabled:opacity-50"
               disabled={!imageRef.current || isDetecting}
-              onClick={() => runFaceDetection()}
+              onClick={runFaceDetection}
               type="button"
             >
               {isDetecting ? <Loader2 className="animate-spin" size={18} /> : <ScanFace size={18} />}
               얼굴 자동 감지
-            </button>
-            <button
-              className="mt-2 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-black text-white disabled:opacity-50"
-              disabled={!imageRef.current || isDetecting}
-              onClick={runFaceDetectionAndBlur}
-              type="button"
-            >
-              {isDetecting ? <Loader2 className="animate-spin" size={18} /> : <ShieldCheck size={18} />}
-              감지 후 블러 적용
             </button>
             <button
               className="mt-2 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-black text-white disabled:opacity-50"
