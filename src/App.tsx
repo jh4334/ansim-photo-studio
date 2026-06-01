@@ -16,7 +16,8 @@ import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 import type { Detection } from '@mediapipe/tasks-vision';
 
 type MaskMode = 'blur' | 'pixelate' | 'black';
-type ToolMode = 'view' | 'manual';
+type MaskShape = 'rect' | 'ellipse';
+type ToolMode = 'view' | 'manual' | 'brush';
 type SourceKind = 'auto' | 'manual';
 type DetectionPreset = 'sensitive' | 'balanced' | 'strict';
 type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se';
@@ -34,6 +35,8 @@ type FaceBox = {
   height: number;
   score: number;
   source: SourceKind;
+  maskMode?: MaskMode;
+  shape?: MaskShape;
 };
 
 type PhotoItem = {
@@ -46,20 +49,38 @@ type PhotoItem = {
   height: number;
 };
 
+type ReadyDownload = {
+  url: string;
+  fileName: string;
+  label: string;
+};
+
+type SaveFileHandle = {
+  createWritable: () => Promise<{
+    write: (data: Blob) => Promise<void>;
+    close: () => Promise<void>;
+  }>;
+};
+
+type SavePickerResult = SaveFileHandle | 'cancelled' | null;
+
+type SaveOutcome = {
+  mode: 'picker' | 'local' | 'browser';
+  path?: string;
+};
+
 type EditInteraction =
   | { kind: 'draw'; start: Point }
+  | { kind: 'brush'; start: Point }
   | { kind: 'move'; id: string; start: Point; originalBox: FaceBox; originalBoxes: FaceBox[] }
   | { kind: 'resize'; id: string; handle: ResizeHandle; start: Point; originalBox: FaceBox; originalBoxes: FaceBox[] };
-
-type ZipEntry = {
-  name: string;
-  data: Uint8Array;
-};
 
 const WASM_PATH = '/models/wasm';
 const SHORT_RANGE_MODEL = '/models/blaze_face_short_range.tflite';
 const FULL_RANGE_MODEL = '/models/blaze_face_full_range.tflite';
 const MIN_BOX_SIZE = 16;
+const LARGE_TOTAL_BYTES = 180 * 1024 * 1024;
+const LARGE_SINGLE_BYTES = 35 * 1024 * 1024;
 
 const DETECTION_PRESETS: Record<DetectionPreset, { label: string; confidence: number; expansion: number; note: string }> = {
   sensitive: { label: '민감', confidence: 0.2, expansion: 0.28, note: '작은 얼굴까지 넓게 찾기' },
@@ -73,6 +94,18 @@ function clamp(value: number, min: number, max: number) {
 
 function safeBaseName(name: string) {
   return name.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_') || 'masked_photo';
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function getFileTimestamp() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
 }
 
 function expandBox(box: FaceBox, imageWidth: number, imageHeight: number, ratio = 0.18): FaceBox {
@@ -142,18 +175,26 @@ function boxFromDetection(
 }
 
 function drawMask(ctx: CanvasRenderingContext2D, image: HTMLImageElement, box: FaceBox, mode: MaskMode, strength: number, scale: number) {
-  const sx = Math.round(box.x);
-  const sy = Math.round(box.y);
-  const sw = Math.round(box.width);
-  const sh = Math.round(box.height);
+  const imageWidth = image.naturalWidth;
+  const imageHeight = image.naturalHeight;
+  const sx = Math.max(0, Math.floor(box.x));
+  const sy = Math.max(0, Math.floor(box.y));
+  const sw = Math.max(1, Math.min(imageWidth - sx, Math.ceil(box.width)));
+  const sh = Math.max(1, Math.min(imageHeight - sy, Math.ceil(box.height)));
   const dx = Math.round(box.x * scale);
   const dy = Math.round(box.y * scale);
   const dw = Math.round(box.width * scale);
   const dh = Math.round(box.height * scale);
 
+  if (dw <= 0 || dh <= 0) return;
+
   ctx.save();
   ctx.beginPath();
-  ctx.rect(dx, dy, dw, dh);
+  if (box.shape === 'ellipse') {
+    ctx.ellipse(dx + dw / 2, dy + dh / 2, dw / 2, dh / 2, 0, 0, Math.PI * 2);
+  } else {
+    ctx.rect(dx, dy, dw, dh);
+  }
   ctx.clip();
 
   if (mode === 'black') {
@@ -175,9 +216,34 @@ function drawMask(ctx: CanvasRenderingContext2D, image: HTMLImageElement, box: F
       ctx.imageSmoothingEnabled = true;
     }
   } else {
-    ctx.filter = `blur(${Math.max(4, strength)}px)`;
-    ctx.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
-    ctx.filter = 'none';
+    const blurRadius = Math.max(4, Math.round(strength * 1.4));
+    const padding = Math.max(blurRadius * 3, 24);
+    const cropX = Math.max(0, sx - padding);
+    const cropY = Math.max(0, sy - padding);
+    const cropRight = Math.min(imageWidth, sx + sw + padding);
+    const cropBottom = Math.min(imageHeight, sy + sh + padding);
+    const cropWidth = Math.max(1, cropRight - cropX);
+    const cropHeight = Math.max(1, cropBottom - cropY);
+    const buffer = document.createElement('canvas');
+    buffer.width = cropWidth;
+    buffer.height = cropHeight;
+    const bufferCtx = buffer.getContext('2d');
+
+    if (bufferCtx) {
+      bufferCtx.filter = `blur(${blurRadius}px)`;
+      bufferCtx.drawImage(image, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+      ctx.drawImage(
+        buffer,
+        0,
+        0,
+        cropWidth,
+        cropHeight,
+        Math.round(cropX * scale),
+        Math.round(cropY * scale),
+        Math.round(cropWidth * scale),
+        Math.round(cropHeight * scale)
+      );
+    }
   }
 
   ctx.restore();
@@ -228,7 +294,9 @@ function drawEditorCanvas(
   strength: number,
   showBoxes: boolean,
   draftBox: FaceBox | null,
-  selectedBoxId: string
+  selectedBoxId: string,
+  pendingAutoBoxes: FaceBox[],
+  draftBrushBoxes: FaceBox[]
 ) {
   const scale = canvas.width / image.naturalWidth;
   const ctx = canvas.getContext('2d');
@@ -238,12 +306,24 @@ function drawEditorCanvas(
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
 
   for (const box of boxes) {
+    drawMask(ctx, image, box, box.maskMode ?? mode, strength, scale);
+  }
+  for (const box of pendingAutoBoxes) {
     drawMask(ctx, image, box, mode, strength, scale);
+  }
+  for (const box of draftBrushBoxes) {
+    drawMask(ctx, image, box, box.maskMode ?? mode, strength, scale);
   }
 
   if (showBoxes) {
     for (const box of boxes) {
       drawBoxOverlay(ctx, box, scale, false, box.id === selectedBoxId);
+    }
+    for (const box of pendingAutoBoxes) {
+      drawBoxOverlay(ctx, box, scale, true, false);
+    }
+    for (const box of draftBrushBoxes) {
+      drawBoxOverlay(ctx, box, scale, true, false);
     }
     if (draftBox) drawBoxOverlay(ctx, draftBox, scale, true, false);
   }
@@ -258,7 +338,7 @@ function drawMaskedCanvas(image: HTMLImageElement, boxes: FaceBox[], mode: MaskM
 
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   for (const box of boxes) {
-    drawMask(ctx, image, box, mode, strength, 1);
+    drawMask(ctx, image, box, box.maskMode ?? mode, strength, 1);
   }
   return canvas;
 }
@@ -284,107 +364,6 @@ function loadImage(url: string) {
   });
 }
 
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i += 1) {
-    let c = i;
-    for (let k = 0; k < 8; k += 1) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(data: Uint8Array) {
-  let crc = 0xffffffff;
-  for (const byte of data) {
-    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function dosTimestamp(date = new Date()) {
-  const year = Math.max(1980, date.getFullYear());
-  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const day = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
-  return { time, day };
-}
-
-function createZip(entries: ZipEntry[]) {
-  const encoder = new TextEncoder();
-  const { time, day } = dosTimestamp();
-  const chunks: Uint8Array[] = [];
-  const centralChunks: Uint8Array[] = [];
-  let offset = 0;
-
-  function writeU16(view: DataView, position: number, value: number) {
-    view.setUint16(position, value, true);
-  }
-
-  function writeU32(view: DataView, position: number, value: number) {
-    view.setUint32(position, value >>> 0, true);
-  }
-
-  for (const entry of entries) {
-    const fileName = encoder.encode(entry.name);
-    const crc = crc32(entry.data);
-    const local = new Uint8Array(30 + fileName.length);
-    const localView = new DataView(local.buffer);
-    writeU32(localView, 0, 0x04034b50);
-    writeU16(localView, 4, 20);
-    writeU16(localView, 6, 0x0800);
-    writeU16(localView, 8, 0);
-    writeU16(localView, 10, time);
-    writeU16(localView, 12, day);
-    writeU32(localView, 14, crc);
-    writeU32(localView, 18, entry.data.length);
-    writeU32(localView, 22, entry.data.length);
-    writeU16(localView, 26, fileName.length);
-    local.set(fileName, 30);
-
-    const central = new Uint8Array(46 + fileName.length);
-    const centralView = new DataView(central.buffer);
-    writeU32(centralView, 0, 0x02014b50);
-    writeU16(centralView, 4, 20);
-    writeU16(centralView, 6, 20);
-    writeU16(centralView, 8, 0x0800);
-    writeU16(centralView, 10, 0);
-    writeU16(centralView, 12, time);
-    writeU16(centralView, 14, day);
-    writeU32(centralView, 16, crc);
-    writeU32(centralView, 20, entry.data.length);
-    writeU32(centralView, 24, entry.data.length);
-    writeU16(centralView, 28, fileName.length);
-    writeU32(centralView, 42, offset);
-    central.set(fileName, 46);
-
-    chunks.push(local, entry.data);
-    centralChunks.push(central);
-    offset += local.length + entry.data.length;
-  }
-
-  const centralOffset = offset;
-  const centralSize = centralChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const end = new Uint8Array(22);
-  const endView = new DataView(end.buffer);
-  writeU32(endView, 0, 0x06054b50);
-  writeU16(endView, 8, entries.length);
-  writeU16(endView, 10, entries.length);
-  writeU32(endView, 12, centralSize);
-  writeU32(endView, 16, centralOffset);
-
-  const allChunks = [...chunks, ...centralChunks, end];
-  const totalLength = allChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const zip = new Uint8Array(totalLength);
-  let cursor = 0;
-  for (const chunk of allChunks) {
-    zip.set(chunk, cursor);
-    cursor += chunk.length;
-  }
-  return zip;
-}
-
 function bytesToArrayBuffer(bytes: Uint8Array) {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
@@ -395,6 +374,8 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const objectUrlsRef = useRef<string[]>([]);
+  const loadRequestRef = useRef(0);
+  const folderSaveCancelRef = useRef(false);
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [currentPhotoId, setCurrentPhotoId] = useState('');
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
@@ -403,13 +384,22 @@ function App() {
   const [maskMode, setMaskMode] = useState<MaskMode>('blur');
   const [strength, setStrength] = useState(18);
   const [confidence, setConfidence] = useState(0.35);
+  const [boxExpansion, setBoxExpansion] = useState(DETECTION_PRESETS.balanced.expansion);
+  const [manualShape, setManualShape] = useState<MaskShape>('rect');
+  const [brushSize, setBrushSize] = useState(42);
   const [detectionPreset, setDetectionPreset] = useState<DetectionPreset>('balanced');
   const [toolMode, setToolMode] = useState<ToolMode>('view');
   const [showBoxes, setShowBoxes] = useState(true);
   const [status, setStatus] = useState('사진을 선택하면 브라우저 안에서 바로 처리합니다.');
+  const [memoryWarning, setMemoryWarning] = useState('');
+  const [operationProgress, setOperationProgress] = useState('');
+  const [readyDownload, setReadyDownload] = useState<ReadyDownload | null>(null);
   const [isDetecting, setIsDetecting] = useState(false);
-  const [isExportingZip, setIsExportingZip] = useState(false);
+  const [isBatchDetecting, setIsBatchDetecting] = useState(false);
+  const [isSavingFolder, setIsSavingFolder] = useState(false);
   const [draftBox, setDraftBox] = useState<FaceBox | null>(null);
+  const [draftBrushBoxes, setDraftBrushBoxes] = useState<FaceBox[]>([]);
+  const [pendingAutoBoxes, setPendingAutoBoxes] = useState<FaceBox[]>([]);
   const [interaction, setInteraction] = useState<EditInteraction | null>(null);
   const [selectedBoxId, setSelectedBoxId] = useState('');
   const [historyPast, setHistoryPast] = useState<FaceBox[][]>([]);
@@ -418,12 +408,28 @@ function App() {
   const currentPhoto = useMemo(() => photos.find((photo) => photo.id === currentPhotoId) ?? null, [photos, currentPhotoId]);
   const autoCount = useMemo(() => boxes.filter((box) => box.source === 'auto').length, [boxes]);
   const manualCount = boxes.length - autoCount;
+  const selectedBox = useMemo(() => boxes.find((box) => box.id === selectedBoxId) ?? null, [boxes, selectedBoxId]);
+  const batchSummary = useMemo(() => {
+    const snapshot = currentPhotoId ? { ...boxesByPhoto, [currentPhotoId]: boxes } : boxesByPhoto;
+    return {
+      processed: photos.filter((photo) => (snapshot[photo.id] ?? []).length > 0).length,
+      totalBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).length, 0),
+      autoBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).filter((box) => box.source === 'auto').length, 0),
+      manualBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).filter((box) => box.source === 'manual').length, 0)
+    };
+  }, [boxes, boxesByPhoto, currentPhotoId, photos]);
 
   useEffect(() => {
     return () => {
       for (const url of objectUrlsRef.current) URL.revokeObjectURL(url);
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (readyDownload) URL.revokeObjectURL(readyDownload.url);
+    };
+  }, [readyDownload]);
 
   useEffect(() => {
     if (!currentPhotoId) return;
@@ -434,8 +440,8 @@ function App() {
     const canvas = canvasRef.current;
     const image = imageRef.current;
     if (!canvas || !image) return;
-    drawEditorCanvas(canvas, image, boxes, maskMode, strength, showBoxes, draftBox, selectedBoxId);
-  }, [boxes, maskMode, strength, showBoxes, draftBox, selectedBoxId]);
+    drawEditorCanvas(canvas, image, boxes, maskMode, strength, showBoxes, draftBox, selectedBoxId, pendingAutoBoxes, draftBrushBoxes);
+  }, [boxes, maskMode, strength, showBoxes, draftBox, selectedBoxId, pendingAutoBoxes, draftBrushBoxes]);
 
   function resetHistory() {
     setHistoryPast([]);
@@ -446,13 +452,16 @@ function App() {
     setHistoryPast((current) => [...current.slice(-19), boxes]);
     setHistoryFuture([]);
     setBoxes(nextBoxes);
+    setPendingAutoBoxes([]);
     setSelectedBoxId(nextSelectedId);
     setStatus(message);
   }
 
   function loadPhoto(photo: PhotoItem, savedBoxes = boxesByPhoto) {
+    const requestId = ++loadRequestRef.current;
     const image = new Image();
     image.onload = () => {
+      if (requestId !== loadRequestRef.current) return;
       imageRef.current = image;
       setCurrentPhotoId(photo.id);
       setImageSize({ width: image.naturalWidth, height: image.naturalHeight });
@@ -461,6 +470,8 @@ function App() {
       );
       setBoxes(savedBoxes[photo.id] ?? []);
       setDraftBox(null);
+      setDraftBrushBoxes([]);
+      setPendingAutoBoxes([]);
       setInteraction(null);
       setSelectedBoxId('');
       setToolMode('view');
@@ -471,12 +482,14 @@ function App() {
         const displayScale = Math.min(1, 1120 / image.naturalWidth);
         canvas.width = Math.max(1, Math.round(image.naturalWidth * displayScale));
         canvas.height = Math.max(1, Math.round(image.naturalHeight * displayScale));
-        drawEditorCanvas(canvas, image, savedBoxes[photo.id] ?? [], maskMode, strength, showBoxes, null, '');
+        drawEditorCanvas(canvas, image, savedBoxes[photo.id] ?? [], maskMode, strength, showBoxes, null, '', [], []);
       }
 
       setStatus('사진을 불러왔습니다. 자동 감지 또는 수동 영역 편집을 진행하세요.');
     };
-    image.onerror = () => setStatus('이미지를 불러오지 못했습니다. 다른 파일로 시도해 주세요.');
+    image.onerror = () => {
+      if (requestId === loadRequestRef.current) setStatus('이미지를 불러오지 못했습니다. 다른 파일로 시도해 주세요.');
+    };
     image.src = photo.url;
   }
 
@@ -486,6 +499,16 @@ function App() {
     if (validFiles.length === 0) {
       setStatus('JPG 또는 PNG 파일만 사용할 수 있습니다.');
       return;
+    }
+
+    const totalBytes = validFiles.reduce((sum, file) => sum + file.size, 0);
+    const largestFile = validFiles.reduce((largest, file) => Math.max(largest, file.size), 0);
+    if (totalBytes > LARGE_TOTAL_BYTES || largestFile > LARGE_SINGLE_BYTES) {
+      setMemoryWarning(
+        `큰 사진 묶음입니다. 총 ${formatBytes(totalBytes)}이며 가장 큰 파일은 ${formatBytes(largestFile)}입니다. 일괄 PNG 저장 중 브라우저가 느려질 수 있습니다.`
+      );
+    } else {
+      setMemoryWarning('');
     }
 
     for (const url of objectUrlsRef.current) URL.revokeObjectURL(url);
@@ -507,6 +530,9 @@ function App() {
 
     setPhotos(nextPhotos);
     setBoxesByPhoto({});
+    setPendingAutoBoxes([]);
+    setDraftBrushBoxes([]);
+    setOperationProgress('');
     resetHistory();
     loadPhoto(nextPhotos[0], {});
 
@@ -532,6 +558,8 @@ function App() {
 
     const preset = DETECTION_PRESETS[detectionPreset];
     setIsDetecting(true);
+    setPendingAutoBoxes([]);
+    setOperationProgress('감지 준비 중');
     setStatus(`${preset.label} 프리셋으로 MediaPipe 얼굴 위치 감지 모델을 실행하는 중입니다.`);
     try {
       const vision = await FilesetResolver.forVisionTasks(WASM_PATH);
@@ -541,7 +569,8 @@ function App() {
       ];
       const detected: FaceBox[] = [];
 
-      for (const run of modelRuns) {
+      for (const [runIndex, run] of modelRuns.entries()) {
+        setOperationProgress(`얼굴 감지 모델 ${runIndex + 1}/${modelRuns.length} 실행 중`);
         const detector = await FaceDetector.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: run.path,
@@ -553,26 +582,107 @@ function App() {
         });
         const result = detector.detect(image);
         result.detections.forEach((detection, index) => {
-          const box = boxFromDetection(detection, index, run.name, image.naturalWidth, image.naturalHeight, preset.expansion);
+          const box = boxFromDetection(detection, index, run.name, image.naturalWidth, image.naturalHeight, boxExpansion);
           if (box) detected.push(box);
         });
         detector.close();
       }
 
-      const manualBoxes = boxes.filter((box) => box.source === 'manual');
-      const merged = mergeBoxes([...detected, ...manualBoxes]);
-      applyBoxes(
-        merged,
-        merged.length > 0
-          ? `자동 감지가 끝났습니다. 감지된 얼굴 ${merged.filter((box) => box.source === 'auto').length}개를 확인해 주세요.`
-          : '자동 감지된 얼굴이 없습니다. 민감 프리셋을 선택하거나 수동 영역 추가를 사용하세요.',
-        ''
+      const detectedBoxes = mergeBoxes(detected).map((box) => ({ ...box, shape: 'rect' as const }));
+      setPendingAutoBoxes(detectedBoxes);
+      setOperationProgress('');
+      setStatus(
+        detectedBoxes.length > 0
+          ? `자동 감지 후보 ${detectedBoxes.length}개를 찾았습니다. 박스를 확인한 뒤 감지 결과 적용을 눌러 주세요.`
+          : '자동 감지된 얼굴이 없습니다. 민감 프리셋을 선택하거나 수동 영역 추가를 사용하세요.'
       );
     } catch (error) {
       setStatus(`얼굴 감지를 실행하지 못했습니다. 모델 파일 위치를 확인해 주세요. ${error instanceof Error ? error.message : ''}`);
     } finally {
+      setOperationProgress('');
       setIsDetecting(false);
     }
+  }
+
+  async function detectBoxesForImage(image: HTMLImageElement, preset: (typeof DETECTION_PRESETS)[DetectionPreset], vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>) {
+    const modelRuns = [
+      { name: 'short', path: SHORT_RANGE_MODEL },
+      { name: 'full', path: FULL_RANGE_MODEL }
+    ];
+    const detected: FaceBox[] = [];
+
+    for (const run of modelRuns) {
+      const detector = await FaceDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: run.path,
+          delegate: 'CPU'
+        },
+        runningMode: 'IMAGE',
+        minDetectionConfidence: confidence,
+        minSuppressionThreshold: detectionPreset === 'sensitive' ? 0.18 : 0.25
+      });
+      const result = detector.detect(image);
+      result.detections.forEach((detection, index) => {
+        const box = boxFromDetection(detection, index, run.name, image.naturalWidth, image.naturalHeight, boxExpansion);
+        if (box) detected.push(box);
+      });
+      detector.close();
+    }
+
+    return mergeBoxes(detected).map((box) => ({ ...box, shape: 'rect' as const }));
+  }
+
+  async function runBatchFaceDetection() {
+    if (photos.length === 0) {
+      setStatus('먼저 사진을 선택해 주세요.');
+      return;
+    }
+
+    const preset = DETECTION_PRESETS[detectionPreset];
+    setIsBatchDetecting(true);
+    setPendingAutoBoxes([]);
+    setOperationProgress(`전체 자동 감지 준비 중 0/${photos.length}`);
+    setStatus('작업 목록 전체 사진에 자동 감지를 실행합니다.');
+
+    try {
+      const vision = await FilesetResolver.forVisionTasks(WASM_PATH);
+      const snapshotBoxesByPhoto = currentPhotoId ? { ...boxesByPhoto, [currentPhotoId]: boxes } : boxesByPhoto;
+      const nextBoxesByPhoto: Record<string, FaceBox[]> = { ...snapshotBoxesByPhoto };
+      let totalDetected = 0;
+
+      for (const [index, photo] of photos.entries()) {
+        setOperationProgress(`전체 자동 감지 중 ${index + 1}/${photos.length}: ${photo.name}`);
+        const image = photo.id === currentPhotoId && imageRef.current ? imageRef.current : await loadImage(photo.url);
+        const detectedBoxes = await detectBoxesForImage(image, preset, vision);
+        const manualBoxes = (snapshotBoxesByPhoto[photo.id] ?? []).filter((box) => box.source === 'manual');
+        nextBoxesByPhoto[photo.id] = mergeBoxes([...detectedBoxes, ...manualBoxes]);
+        totalDetected += detectedBoxes.length;
+      }
+
+      setBoxesByPhoto(nextBoxesByPhoto);
+      if (currentPhotoId) setBoxes(nextBoxesByPhoto[currentPhotoId] ?? []);
+      setStatus(`전체 자동 감지가 끝났습니다. ${photos.length}장 기준 자동 후보 ${totalDetected}개를 바로 적용했습니다. 현재 가림 설정으로 PNG 저장에 반영됩니다.`);
+    } catch (error) {
+      setStatus(`전체 자동 감지를 완료하지 못했습니다. ${error instanceof Error ? error.message : ''}`);
+    } finally {
+      setOperationProgress('');
+      setIsBatchDetecting(false);
+    }
+  }
+
+  function applyPendingAutoBoxes() {
+    if (pendingAutoBoxes.length === 0) {
+      setStatus('적용할 자동 감지 후보가 없습니다.');
+      return;
+    }
+    const manualBoxes = boxes.filter((box) => box.source === 'manual');
+    const merged = mergeBoxes([...pendingAutoBoxes, ...manualBoxes]);
+    applyBoxes(merged, `자동 감지 후보 ${pendingAutoBoxes.length}개를 적용했습니다. 필요 없는 영역은 삭제하거나 조정하세요.`, '');
+  }
+
+  function cancelPendingAutoBoxes() {
+    setPendingAutoBoxes([]);
+    setStatus('자동 감지 후보 적용을 취소했습니다. 기존 영역은 유지됩니다.');
   }
 
   function pointerToImagePoint(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -634,6 +744,23 @@ function App() {
     };
   }
 
+  function makeBrushBox(point: Point): FaceBox {
+    const image = imageRef.current;
+    const size = brushSize;
+    const x = image ? clamp(point.x - size / 2, 0, Math.max(0, image.naturalWidth - size)) : point.x - size / 2;
+    const y = image ? clamp(point.y - size / 2, 0, Math.max(0, image.naturalHeight - size)) : point.y - size / 2;
+    return {
+      id: `brush-${Date.now()}-${Math.round(point.x)}-${Math.round(point.y)}`,
+      x,
+      y,
+      width: size,
+      height: size,
+      score: 1,
+      source: 'manual',
+      shape: 'ellipse'
+    };
+  }
+
   function handlePointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
     if (!imageRef.current) return;
     const point = pointerToImagePoint(event);
@@ -649,8 +776,17 @@ function App() {
         width: 1,
         height: 1,
         score: 1,
-        source: 'manual'
+        source: 'manual',
+        shape: manualShape
       });
+      return;
+    }
+
+    if (toolMode === 'brush') {
+      const firstBox = makeBrushBox(point);
+      setInteraction({ kind: 'brush', start: point });
+      setDraftBrushBoxes([firstBox]);
+      setStatus('브러시로 가릴 영역을 칠하는 중입니다.');
       return;
     }
 
@@ -687,7 +823,22 @@ function App() {
         width: Math.abs(point.x - interaction.start.x),
         height: Math.abs(point.y - interaction.start.y),
         score: 1,
-        source: 'manual'
+        source: 'manual',
+        shape: manualShape
+      });
+      return;
+    }
+
+    if (interaction.kind === 'brush') {
+      setDraftBrushBoxes((current) => {
+        const last = current[current.length - 1];
+        if (last) {
+          const centerX = last.x + last.width / 2;
+          const centerY = last.y + last.height / 2;
+          const distance = Math.hypot(point.x - centerX, point.y - centerY);
+          if (distance < brushSize * 0.45) return current;
+        }
+        return [...current, makeBrushBox(point)];
       });
       return;
     }
@@ -710,6 +861,7 @@ function App() {
     if (!interaction || !imageRef.current) {
       setInteraction(null);
       setDraftBox(null);
+      setDraftBrushBoxes([]);
       return;
     }
 
@@ -722,6 +874,10 @@ function App() {
         };
         applyBoxes([...boxes, nextBox], '수동 얼굴 영역을 추가했습니다. 노란 테두리를 드래그해 수정할 수 있습니다.', nextBox.id);
       }
+    } else if (interaction.kind === 'brush') {
+      if (draftBrushBoxes.length > 0) {
+        applyBoxes([...boxes, ...draftBrushBoxes], `브러시 마스킹 영역 ${draftBrushBoxes.length}개를 추가했습니다.`, '');
+      }
     } else {
       setHistoryPast((current) => [...current.slice(-19), interaction.originalBoxes]);
       setHistoryFuture([]);
@@ -730,6 +886,7 @@ function App() {
 
     setInteraction(null);
     setDraftBox(null);
+    setDraftBrushBoxes([]);
   }
 
   function undoBoxes() {
@@ -758,12 +915,89 @@ function App() {
     return drawMaskedCanvas(image, boxes, maskMode, strength);
   }
 
-  function downloadBlob(blob: Blob, fileName: string) {
+  function prepareDownload(blob: Blob, fileName: string, label: string) {
     const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
     link.download = fileName;
-    link.href = URL.createObjectURL(blob);
+    link.href = url;
+    link.rel = 'noopener';
+    link.style.display = 'none';
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(link.href);
+    link.remove();
+    setReadyDownload({ url, fileName, label });
+  }
+
+  async function pickSaveTarget(fileName: string, mimeType: string, extensions: string[]): Promise<SavePickerResult> {
+    const picker = (window as Window & {
+      showSaveFilePicker?: (options: {
+        suggestedName: string;
+        types: Array<{ description: string; accept: Record<string, string[]> }>;
+      }) => Promise<SaveFileHandle>;
+    }).showSaveFilePicker;
+
+    if (!picker) return null;
+
+    try {
+      return await picker({
+        suggestedName: fileName,
+        types: [
+          {
+            description: 'PNG 이미지',
+            accept: { [mimeType]: extensions }
+          }
+        ]
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled';
+      throw error;
+    }
+  }
+
+  async function saveViaLocalServer(blob: Blob, fileName: string, folderName?: string) {
+    const headers: Record<string, string> = {
+      'content-type': 'application/octet-stream',
+      'x-ansim-filename': encodeURIComponent(fileName)
+    };
+    if (folderName) headers['x-ansim-folder'] = encodeURIComponent(folderName);
+
+    const response = await fetch('/__ansim_save', {
+      method: 'POST',
+      headers,
+      body: blob
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result.message || '로컬 저장 실패');
+    }
+    return String(result.path || '');
+  }
+
+  async function savePreparedBlob(blob: Blob, fileName: string, label: string, handle: SavePickerResult): Promise<SaveOutcome> {
+    if (handle && handle !== 'cancelled') {
+      try {
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+
+        const url = URL.createObjectURL(blob);
+        setReadyDownload({ url, fileName, label });
+        return { mode: 'picker' };
+      } catch {
+        // Some embedded browsers expose the picker but block actual writes.
+        // Fall through to the localhost save route for local desktop use.
+      }
+    }
+
+    try {
+      const savedPath = await saveViaLocalServer(blob, fileName);
+      const url = URL.createObjectURL(blob);
+      setReadyDownload({ url, fileName, label });
+      return { mode: 'local', path: savedPath };
+    } catch {
+      prepareDownload(blob, fileName, label);
+      return { mode: 'browser' };
+    }
   }
 
   async function downloadPng() {
@@ -773,41 +1007,80 @@ function App() {
       return;
     }
 
-    const bytes = await canvasToPngBytes(canvas);
-    downloadBlob(new Blob([bytesToArrayBuffer(bytes)], { type: 'image/png' }), `안심사진관_${safeBaseName(currentPhoto.name)}.png`);
-    setStatus('현재 사진의 처리 결과 PNG를 다운로드했습니다. 원본은 수정하지 않았습니다.');
-  }
-
-  async function downloadZip() {
-    if (photos.length === 0) {
-      setStatus('ZIP으로 저장할 사진이 없습니다.');
+    const fileName = `안심사진관_${safeBaseName(currentPhoto.name)}.png`;
+    const saveTarget = await pickSaveTarget(fileName, 'image/png', ['.png']);
+    if (saveTarget === 'cancelled') {
+      setStatus('PNG 저장을 취소했습니다.');
       return;
     }
 
-    setIsExportingZip(true);
-    setStatus('작업 목록의 사진을 PNG로 변환해 ZIP을 만드는 중입니다.');
+    const bytes = await canvasToPngBytes(canvas);
+    const result = await savePreparedBlob(new Blob([bytesToArrayBuffer(bytes)], { type: 'image/png' }), fileName, '현재 사진 PNG', saveTarget);
+    setStatus(
+      result.mode === 'picker'
+        ? '현재 사진 PNG를 선택한 위치에 저장했습니다.'
+        : result.mode === 'local'
+          ? `현재 사진 PNG를 내 PC에 저장했습니다: ${result.path}`
+          : '현재 사진 PNG 다운로드를 준비했습니다. 자동으로 내려받아지지 않으면 화면의 다시 다운로드 버튼을 눌러 주세요.'
+    );
+  }
+
+  async function saveAllPngFolder() {
+    if (photos.length === 0) {
+      setStatus('PNG로 저장할 사진이 없습니다.');
+      return;
+    }
+
+    const exportPhotos = photos;
+    const folderName = `안심사진관_${getFileTimestamp()}`;
+
+    folderSaveCancelRef.current = false;
+    setIsSavingFolder(true);
+    setReadyDownload(null);
+    setOperationProgress(`PNG 폴더 저장 준비 중 0/${exportPhotos.length}`);
+    setStatus(`작업 목록의 모든 사진을 PNG로 저장하는 중입니다. 저장 폴더: Downloads\\안심사진관\\${folderName}`);
     try {
       const snapshotBoxesByPhoto = currentPhotoId ? { ...boxesByPhoto, [currentPhotoId]: boxes } : boxesByPhoto;
-      const entries: ZipEntry[] = [];
+      let savedCount = 0;
+      let lastPath = '';
 
-      for (const photo of photos) {
+      for (const [index, photo] of exportPhotos.entries()) {
+        if (folderSaveCancelRef.current) {
+          setStatus('PNG 폴더 저장을 취소했습니다.');
+          return;
+        }
+        setOperationProgress(`PNG 저장 중 ${index + 1}/${exportPhotos.length}: ${photo.name}`);
         const image = await loadImage(photo.url);
         const canvas = drawMaskedCanvas(image, snapshotBoxesByPhoto[photo.id] ?? [], maskMode, strength);
         if (!canvas) continue;
-        entries.push({
-          name: `안심사진관_${safeBaseName(photo.name)}.png`,
-          data: await canvasToPngBytes(canvas)
-        });
+        const bytes = await canvasToPngBytes(canvas);
+        lastPath = await saveViaLocalServer(
+          new Blob([bytesToArrayBuffer(bytes)], { type: 'image/png' }),
+          `안심사진관_${String(index + 1).padStart(3, '0')}_${safeBaseName(photo.name)}.png`,
+          folderName
+        );
+        savedCount += 1;
       }
 
-      const zip = createZip(entries);
-      downloadBlob(new Blob([bytesToArrayBuffer(zip)], { type: 'application/zip' }), '안심사진관_일괄처리.zip');
-      setStatus(`${entries.length}장의 처리 결과를 ZIP으로 다운로드했습니다.`);
+      if (folderSaveCancelRef.current) {
+        setStatus('PNG 폴더 저장을 취소했습니다.');
+        return;
+      }
+
+      const folderPath = lastPath ? lastPath.replace(/\\[^\\]+$/, '') : `C:\\Users\\USER\\Downloads\\안심사진관\\${folderName}`;
+      setStatus(`${savedCount}장의 처리 결과 PNG를 폴더에 저장했습니다: ${folderPath}`);
     } catch (error) {
-      setStatus(`ZIP 다운로드를 만들지 못했습니다. ${error instanceof Error ? error.message : ''}`);
+      setStatus(`PNG 폴더 저장을 완료하지 못했습니다. ${error instanceof Error ? error.message : ''}`);
     } finally {
-      setIsExportingZip(false);
+      setOperationProgress('');
+      setIsSavingFolder(false);
+      folderSaveCancelRef.current = false;
     }
+  }
+
+  function cancelFolderSave() {
+    folderSaveCancelRef.current = true;
+    setOperationProgress('PNG 폴더 저장 취소 중');
   }
 
   function removeBox(id: string) {
@@ -825,7 +1098,17 @@ function App() {
   function applyPreset(preset: DetectionPreset) {
     setDetectionPreset(preset);
     setConfidence(DETECTION_PRESETS[preset].confidence);
+    setBoxExpansion(DETECTION_PRESETS[preset].expansion);
     setStatus(`${DETECTION_PRESETS[preset].label} 감지 프리셋을 선택했습니다. 자동 감지를 다시 실행해 주세요.`);
+  }
+
+  function updateSelectedBox(patch: Partial<FaceBox>) {
+    if (!selectedBoxId) return;
+    applyBoxes(
+      boxes.map((box) => (box.id === selectedBoxId ? { ...box, ...patch } : box)),
+      '선택한 영역의 가림 옵션을 변경했습니다.',
+      selectedBoxId
+    );
   }
 
   return (
@@ -879,6 +1162,7 @@ function App() {
                 </div>
               </dl>
             )}
+            {memoryWarning && <p className="mt-3 rounded-lg bg-amber-50 p-3 text-xs font-bold text-amber-800">{memoryWarning}</p>}
           </section>
 
           {photos.length > 0 && (
@@ -942,6 +1226,18 @@ function App() {
               />
               <span className="text-xs text-slate-500">값이 낮을수록 더 민감하게 감지합니다. 현재 {confidence.toFixed(2)}</span>
             </label>
+            <label className="mb-3 grid gap-2 text-sm font-bold">
+              얼굴 박스 확장률
+              <input
+                min="0"
+                max="0.45"
+                step="0.01"
+                type="range"
+                value={boxExpansion}
+                onChange={(event) => setBoxExpansion(Number(event.target.value))}
+              />
+              <span className="text-xs text-slate-500">얼굴 주변 여유를 {(boxExpansion * 100).toFixed(0)}% 포함합니다.</span>
+            </label>
             <button
               className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 text-sm font-black text-white disabled:opacity-50"
               disabled={!imageRef.current || isDetecting}
@@ -951,6 +1247,28 @@ function App() {
               {isDetecting ? <Loader2 className="animate-spin" size={18} /> : <ScanFace size={18} />}
               얼굴 자동 감지
             </button>
+            <button
+              className="mt-2 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-black text-white disabled:opacity-50"
+              disabled={photos.length === 0 || isDetecting || isBatchDetecting}
+              onClick={runBatchFaceDetection}
+              type="button"
+            >
+              {isBatchDetecting ? <Loader2 className="animate-spin" size={18} /> : <Images size={18} />}
+              전체 사진 일괄 감지
+            </button>
+            {pendingAutoBoxes.length > 0 && (
+              <div className="mt-3 grid gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3">
+                <p className="text-xs font-bold text-blue-800">자동 감지 후보 {pendingAutoBoxes.length}개를 미리보기 중입니다.</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button className="min-h-9 rounded-lg bg-blue-600 text-sm font-black text-white" onClick={applyPendingAutoBoxes} type="button">
+                    감지 결과 적용
+                  </button>
+                  <button className="min-h-9 rounded-lg border border-blue-200 bg-white text-sm font-black text-blue-700" onClick={cancelPendingAutoBoxes} type="button">
+                    취소
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
 
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
@@ -978,6 +1296,7 @@ function App() {
               <input min="4" max="42" step="1" type="range" value={strength} onChange={(event) => setStrength(Number(event.target.value))} />
               <span className="text-xs text-slate-500">현재 강도 {strength}</span>
             </label>
+            <p className="mt-3 rounded-lg bg-slate-50 p-3 text-xs font-bold text-slate-600">가장 안전한 게시용 기본값은 모자이크 또는 검은 박스입니다. 블러는 강도를 충분히 높여 주세요.</p>
           </section>
 
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
@@ -993,6 +1312,35 @@ function App() {
               >
                 {toolMode === 'manual' ? '수동 추가 중' : '수동으로 얼굴 영역 추가'}
               </button>
+              <button
+                className={`min-h-10 rounded-lg border text-sm font-black ${
+                  toolMode === 'brush' ? 'border-orange-500 bg-orange-500 text-white' : 'border-slate-200 bg-slate-50 text-slate-700'
+                }`}
+                disabled={!imageRef.current}
+                onClick={() => setToolMode((current) => (current === 'brush' ? 'view' : 'brush'))}
+                type="button"
+              >
+                {toolMode === 'brush' ? '브러시 칠하기 중' : '브러시로 민감정보 칠하기'}
+              </button>
+              <div className="grid grid-cols-2 gap-2">
+                {(['rect', 'ellipse'] as MaskShape[]).map((shape) => (
+                  <button
+                    className={`min-h-9 rounded-lg border text-xs font-black ${
+                      manualShape === shape ? 'border-slate-950 bg-slate-950 text-white' : 'border-slate-200 bg-white text-slate-700'
+                    }`}
+                    key={shape}
+                    onClick={() => setManualShape(shape)}
+                    type="button"
+                  >
+                    {shape === 'rect' ? '사각형' : '타원형'}
+                  </button>
+                ))}
+              </div>
+              <label className="grid gap-2 text-sm font-bold">
+                브러시 크기
+                <input min="16" max="240" step="2" type="range" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
+                <span className="text-xs text-slate-500">현재 {brushSize}px</span>
+              </label>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   className="flex min-h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white text-sm font-black text-slate-700 disabled:opacity-50"
@@ -1035,7 +1383,7 @@ function App() {
         </aside>
 
         <section className="grid gap-4">
-          <div className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-5">
+          <div className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-6">
             <div className="rounded-lg bg-slate-100 p-3">
               <span className="text-xs font-bold text-slate-500">사진</span>
               <strong className="block text-2xl">{photos.length}</strong>
@@ -1052,6 +1400,10 @@ function App() {
               <span className="text-xs font-bold text-orange-700">수동 추가</span>
               <strong className="block text-2xl text-orange-800">{manualCount}</strong>
             </div>
+            <div className="rounded-lg bg-emerald-50 p-3">
+              <span className="text-xs font-bold text-emerald-700">처리된 사진</span>
+              <strong className="block text-2xl text-emerald-800">{batchSummary.processed}</strong>
+            </div>
             <div className="grid gap-2">
               <button
                 className="flex min-h-10 items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-black text-white disabled:opacity-50"
@@ -1064,15 +1416,70 @@ function App() {
               </button>
               <button
                 className="flex min-h-10 items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 text-sm font-black text-white disabled:opacity-50"
-                disabled={photos.length === 0 || isExportingZip}
-                onClick={downloadZip}
+                disabled={photos.length === 0 || isSavingFolder}
+                onClick={saveAllPngFolder}
                 type="button"
               >
-                {isExportingZip ? <Loader2 className="animate-spin" size={18} /> : <Download size={18} />}
-                ZIP
+                {isSavingFolder ? <Loader2 className="animate-spin" size={18} /> : <Download size={18} />}
+                PNG 폴더 저장
               </button>
             </div>
           </div>
+
+          <div className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-4">
+            <div className="rounded-lg bg-slate-50 p-3">
+              <span className="text-xs font-bold text-slate-500">전체 등록 영역</span>
+              <strong className="block text-2xl">{batchSummary.totalBoxes}</strong>
+            </div>
+            <div className="rounded-lg bg-blue-50 p-3">
+              <span className="text-xs font-bold text-blue-700">전체 자동 영역</span>
+              <strong className="block text-2xl text-blue-800">{batchSummary.autoBoxes}</strong>
+            </div>
+            <div className="rounded-lg bg-orange-50 p-3">
+              <span className="text-xs font-bold text-orange-700">전체 수동 영역</span>
+              <strong className="block text-2xl text-orange-800">{batchSummary.manualBoxes}</strong>
+            </div>
+            <button
+              className="flex min-h-16 items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 font-black text-white disabled:opacity-50"
+              disabled={photos.length === 0 || isBatchDetecting}
+              onClick={runBatchFaceDetection}
+              type="button"
+            >
+              {isBatchDetecting ? <Loader2 className="animate-spin" size={18} /> : <ScanFace size={18} />}
+              전체 사진 일괄 감지
+            </button>
+          </div>
+          <p className="rounded-lg bg-slate-50 p-3 text-xs font-bold text-slate-600">
+            일괄 감지 후 가림 방식이나 강도를 바꾸면 모든 사진의 저장 결과에 바로 반영됩니다. 최종 저장은 PNG 폴더 저장 버튼을 누르면 됩니다.
+          </p>
+
+          {(operationProgress || isSavingFolder) && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm font-bold text-blue-800">
+              <span>{operationProgress || '작업 처리 중'}</span>
+              {isSavingFolder && (
+                <button className="min-h-9 rounded-lg border border-blue-200 bg-white px-3 text-blue-700" onClick={cancelFolderSave} type="button">
+                  저장 취소
+                </button>
+              )}
+            </div>
+          )}
+
+          {readyDownload && (
+            <div className="flex flex-col gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm font-bold text-emerald-900 md:flex-row md:items-center md:justify-between">
+              <span>
+                다운로드 준비됨: {readyDownload.label}
+                <span className="ml-2 font-semibold text-emerald-700">{readyDownload.fileName}</span>
+              </span>
+              <a
+                className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 text-white"
+                download={readyDownload.fileName}
+                href={readyDownload.url}
+              >
+                <Download size={18} />
+                다시 다운로드
+              </a>
+            </div>
+          )}
 
           <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
             <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -1088,7 +1495,7 @@ function App() {
             </div>
             <div className="overflow-auto rounded-lg border border-slate-200 bg-slate-950 p-2">
               <canvas
-                className={`mx-auto block max-w-full rounded bg-white ${toolMode === 'manual' ? 'cursor-crosshair' : 'cursor-move'}`}
+                className={`mx-auto block max-w-full rounded bg-white ${toolMode === 'manual' || toolMode === 'brush' ? 'cursor-crosshair' : 'cursor-move'}`}
                 ref={canvasRef}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -1109,6 +1516,48 @@ function App() {
 
           <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
             <h2 className="mb-3 text-lg font-black">감지/수동 영역 목록</h2>
+            {selectedBox && (
+              <div className="mb-4 grid gap-3 rounded-lg border border-yellow-200 bg-yellow-50 p-3">
+                <div>
+                  <strong className="text-sm">선택 영역 개별 설정</strong>
+                  <p className="mt-1 text-xs font-semibold text-yellow-800">선택한 영역만 다른 가림 방식이나 형태로 조정할 수 있습니다.</p>
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      ['blur', '블러'],
+                      ['pixelate', '모자이크'],
+                      ['black', '검은 박스']
+                    ].map(([value, label]) => (
+                      <button
+                        className={`min-h-9 rounded-lg border px-2 text-xs font-black ${
+                          (selectedBox.maskMode ?? maskMode) === value ? 'border-yellow-600 bg-yellow-500 text-white' : 'border-yellow-200 bg-white text-yellow-900'
+                        }`}
+                        key={value}
+                        onClick={() => updateSelectedBox({ maskMode: value as MaskMode })}
+                        type="button"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(['rect', 'ellipse'] as MaskShape[]).map((shape) => (
+                      <button
+                        className={`min-h-9 rounded-lg border px-2 text-xs font-black ${
+                          (selectedBox.shape ?? 'rect') === shape ? 'border-yellow-600 bg-yellow-500 text-white' : 'border-yellow-200 bg-white text-yellow-900'
+                        }`}
+                        key={shape}
+                        onClick={() => updateSelectedBox({ shape })}
+                        type="button"
+                      >
+                        {shape === 'rect' ? '사각형' : '타원형'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
             {boxes.length === 0 ? (
               <p className="rounded-lg bg-slate-50 p-4 text-sm font-semibold text-slate-500">
                 등록된 얼굴 영역이 없습니다. 자동 감지를 실행하거나 수동으로 영역을 추가하세요.
