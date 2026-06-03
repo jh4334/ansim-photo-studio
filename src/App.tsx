@@ -106,6 +106,20 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function isBrushBox(box: FaceBox) {
+  return box.id.startsWith('brush-');
+}
+
+function visibleAreaCount(boxes: FaceBox[]) {
+  const brushCount = boxes.filter(isBrushBox).length;
+  return boxes.filter((box) => !isBrushBox(box)).length + (brushCount > 0 ? 1 : 0);
+}
+
+function visibleManualCount(boxes: FaceBox[]) {
+  const brushCount = boxes.filter(isBrushBox).length;
+  return boxes.filter((box) => box.source === 'manual' && !isBrushBox(box)).length + (brushCount > 0 ? 1 : 0);
+}
+
 function safeBaseName(name: string) {
   return name.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_') || 'masked_photo';
 }
@@ -268,7 +282,13 @@ function drawBoxOverlay(ctx: CanvasRenderingContext2D, box: FaceBox, scale: numb
   ctx.strokeStyle = color;
   ctx.lineWidth = isSelected ? 4 : 3;
   ctx.setLineDash(isDraft ? [8, 6] : []);
-  ctx.strokeRect(x, y, width, height);
+  ctx.beginPath();
+  if (box.shape === 'ellipse') {
+    ctx.ellipse(x + width / 2, y + height / 2, width / 2, height / 2, 0, 0, Math.PI * 2);
+  } else {
+    ctx.rect(x, y, width, height);
+  }
+  ctx.stroke();
   ctx.fillStyle = color;
   ctx.font = 'bold 13px system-ui';
   ctx.fillRect(x, Math.max(0, y - 24), box.source === 'manual' ? 76 : 62, 22);
@@ -415,16 +435,14 @@ function App() {
 
   const currentPhoto = useMemo(() => photos.find((photo) => photo.id === currentPhotoId) ?? null, [photos, currentPhotoId]);
   const autoCount = useMemo(() => boxes.filter((box) => box.source === 'auto').length, [boxes]);
-  const manualCount = boxes.length - autoCount;
+  const manualCount = useMemo(() => visibleManualCount(boxes), [boxes]);
+  const areaCount = useMemo(() => visibleAreaCount(boxes), [boxes]);
+  const brushBoxes = useMemo(() => boxes.filter(isBrushBox), [boxes]);
+  const listedBoxes = useMemo(() => boxes.filter((box) => !isBrushBox(box)), [boxes]);
   const selectedBox = useMemo(() => boxes.find((box) => box.id === selectedBoxId) ?? null, [boxes, selectedBoxId]);
-  const batchSummary = useMemo(() => {
+  const processedPhotoCount = useMemo(() => {
     const snapshot = currentPhotoId ? { ...boxesByPhoto, [currentPhotoId]: boxes } : boxesByPhoto;
-    return {
-      processed: photos.filter((photo) => (snapshot[photo.id] ?? []).length > 0).length,
-      totalBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).length, 0),
-      autoBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).filter((box) => box.source === 'auto').length, 0),
-      manualBoxes: photos.reduce((sum, photo) => sum + (snapshot[photo.id] ?? []).filter((box) => box.source === 'manual').length, 0)
-    };
+    return photos.filter((photo) => (snapshot[photo.id] ?? []).length > 0).length;
   }, [boxes, boxesByPhoto, currentPhotoId, photos]);
 
   useEffect(() => {
@@ -729,7 +747,20 @@ function App() {
   }
 
   function boxAtPoint(point: Point) {
-    return [...boxes].reverse().find((box) => point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height) ?? null;
+    return (
+      [...boxes].reverse().find((box) => {
+        const isInsideBounds = point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height;
+        if (!isInsideBounds) return false;
+        if (box.shape !== 'ellipse') return true;
+
+        const radiusX = box.width / 2;
+        const radiusY = box.height / 2;
+        if (radiusX <= 0 || radiusY <= 0) return false;
+        const normalizedX = (point.x - (box.x + radiusX)) / radiusX;
+        const normalizedY = (point.y - (box.y + radiusY)) / radiusY;
+        return normalizedX * normalizedX + normalizedY * normalizedY <= 1;
+      }) ?? null
+    );
   }
 
   function resizeBox(box: FaceBox, handle: ResizeHandle, dx: number, dy: number, imageWidth: number, imageHeight: number): FaceBox {
@@ -884,7 +915,7 @@ function App() {
       }
     } else if (interaction.kind === 'brush') {
       if (draftBrushBoxes.length > 0) {
-        applyBoxes([...boxes, ...draftBrushBoxes], `브러시 마스킹 영역 ${draftBrushBoxes.length}개를 추가했습니다.`, '');
+        applyBoxes([...boxes, ...draftBrushBoxes], `브러시 영역 1개를 추가했습니다. ${draftBrushBoxes.length}개 지점은 목록에서 묶어 표시됩니다.`, '');
       }
     } else {
       setHistoryPast((current) => [...current.slice(-19), interaction.originalBoxes]);
@@ -1152,6 +1183,14 @@ function App() {
     );
   }
 
+  function removeBrushBoxes() {
+    applyBoxes(
+      boxes.filter((box) => !isBrushBox(box)),
+      `브러시 영역 묶음(${brushBoxes.length}개 지점)을 삭제했습니다.`,
+      selectedBox && isBrushBox(selectedBox) ? '' : selectedBoxId
+    );
+  }
+
   function resetAll() {
     applyBoxes([], '모든 얼굴 영역을 지웠습니다. 원본 사진은 그대로 유지됩니다.', '');
   }
@@ -1234,7 +1273,7 @@ function App() {
               </h2>
               <div className="grid max-h-60 gap-2 overflow-auto">
                 {photos.map((photo, index) => {
-                  const count = (photo.id === currentPhotoId ? boxes : boxesByPhoto[photo.id] ?? []).length;
+                  const count = visibleAreaCount(photo.id === currentPhotoId ? boxes : boxesByPhoto[photo.id] ?? []);
                   return (
                     <button
                       className={`grid gap-1 rounded-lg border p-3 text-left text-sm ${
@@ -1383,25 +1422,29 @@ function App() {
               >
                 {toolMode === 'brush' ? '브러시 칠하기 중' : '브러시로 민감정보 칠하기'}
               </button>
-              <div className="grid grid-cols-2 gap-2">
-                {(['rect', 'ellipse'] as MaskShape[]).map((shape) => (
-                  <button
-                    className={`min-h-9 rounded-lg border text-xs font-black ${
-                      manualShape === shape ? 'border-slate-950 bg-slate-950 text-white' : 'border-slate-200 bg-white text-slate-700'
-                    }`}
-                    key={shape}
-                    onClick={() => setManualShape(shape)}
-                    type="button"
-                  >
-                    {shape === 'rect' ? '사각형' : '타원형'}
-                  </button>
-                ))}
-              </div>
-              <label className="grid gap-2 text-sm font-bold">
-                브러시 크기
-                <input min="16" max="240" step="2" type="range" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
-                <span className="text-xs text-slate-500">현재 {brushSize}px</span>
-              </label>
+              {toolMode === 'manual' && (
+                <div className="grid grid-cols-2 gap-2">
+                  {(['rect', 'ellipse'] as MaskShape[]).map((shape) => (
+                    <button
+                      className={`min-h-9 rounded-lg border text-xs font-black ${
+                        manualShape === shape ? 'border-slate-950 bg-slate-950 text-white' : 'border-slate-200 bg-white text-slate-700'
+                      }`}
+                      key={shape}
+                      onClick={() => setManualShape(shape)}
+                      type="button"
+                    >
+                      {shape === 'rect' ? '사각형' : '타원형'}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {toolMode === 'brush' && (
+                <label className="grid gap-2 text-sm font-bold">
+                  브러시 크기
+                  <input min="16" max="240" step="2" type="range" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
+                  <span className="text-xs text-slate-500">현재 {brushSize}px</span>
+                </label>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   className="flex min-h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white text-sm font-black text-slate-700 disabled:opacity-50"
@@ -1451,7 +1494,7 @@ function App() {
             </div>
             <div className="rounded-lg bg-slate-100 p-3">
               <span className="text-xs font-bold text-slate-500">전체 영역</span>
-              <strong className="block text-2xl">{boxes.length}</strong>
+              <strong className="block text-2xl">{areaCount}</strong>
             </div>
             <div className="rounded-lg bg-blue-50 p-3">
               <span className="text-xs font-bold text-blue-700">자동 감지</span>
@@ -1463,7 +1506,7 @@ function App() {
             </div>
             <div className="rounded-lg bg-emerald-50 p-3">
               <span className="text-xs font-bold text-emerald-700">처리된 사진</span>
-              <strong className="block text-2xl text-emerald-800">{batchSummary.processed}</strong>
+              <strong className="block text-2xl text-emerald-800">{processedPhotoCount}</strong>
             </div>
             <div className="grid gap-2">
               <button
@@ -1486,33 +1529,6 @@ function App() {
               </button>
             </div>
           </div>
-
-          <div className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-4">
-            <div className="rounded-lg bg-slate-50 p-3">
-              <span className="text-xs font-bold text-slate-500">전체 등록 영역</span>
-              <strong className="block text-2xl">{batchSummary.totalBoxes}</strong>
-            </div>
-            <div className="rounded-lg bg-blue-50 p-3">
-              <span className="text-xs font-bold text-blue-700">전체 자동 영역</span>
-              <strong className="block text-2xl text-blue-800">{batchSummary.autoBoxes}</strong>
-            </div>
-            <div className="rounded-lg bg-orange-50 p-3">
-              <span className="text-xs font-bold text-orange-700">전체 수동 영역</span>
-              <strong className="block text-2xl text-orange-800">{batchSummary.manualBoxes}</strong>
-            </div>
-            <button
-              className="flex min-h-16 items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 font-black text-white disabled:opacity-50"
-              disabled={photos.length === 0 || isBatchDetecting}
-              onClick={runBatchFaceDetection}
-              type="button"
-            >
-              {isBatchDetecting ? <Loader2 className="animate-spin" size={18} /> : <ScanFace size={18} />}
-              전체 사진 일괄 감지
-            </button>
-          </div>
-          <p className="rounded-lg bg-slate-50 p-3 text-xs font-bold text-slate-600">
-            일괄 감지 후 가림 방식이나 강도를 바꾸면 모든 사진의 저장 결과에 바로 반영됩니다. 최종 저장은 PNG 폴더 저장 버튼을 누르면 됩니다.
-          </p>
 
           {(operationProgress || isSavingFolder) && (
             <div className="flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm font-bold text-blue-800">
@@ -1549,6 +1565,8 @@ function App() {
                 <p className="text-sm text-slate-500">
                   {toolMode === 'manual'
                     ? '사진 위에서 드래그하면 수동 얼굴 영역이 추가됩니다.'
+                    : toolMode === 'brush'
+                      ? '사진 위를 드래그하면 브러시 영역이 추가됩니다.'
                     : '박스를 클릭해 선택하고, 드래그로 이동하거나 모서리 핸들로 크기를 조정하세요.'}
                 </p>
               </div>
@@ -1625,14 +1643,31 @@ function App() {
               </p>
             ) : (
               <div className="grid gap-2">
-                {boxes.map((box, index) => (
+                {brushBoxes.length > 0 && (
+                  <article className="grid gap-3 rounded-lg border border-orange-200 bg-orange-50 p-3 md:grid-cols-[64px_1fr_110px]">
+                    <strong className="text-sm">#1</strong>
+                    <div className="text-left text-sm text-slate-600">
+                      <b className="text-orange-700">브러시 영역</b>
+                      <span className="ml-2">{brushBoxes.length}개 지점을 하나로 묶어 표시</span>
+                    </div>
+                    <button
+                      className="flex min-h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white text-sm font-black text-rose-700"
+                      onClick={removeBrushBoxes}
+                      type="button"
+                    >
+                      <Trash2 size={15} />
+                      삭제
+                    </button>
+                  </article>
+                )}
+                {listedBoxes.map((box, index) => (
                   <article
                     className={`grid gap-3 rounded-lg border p-3 md:grid-cols-[64px_1fr_110px] ${
                       selectedBoxId === box.id ? 'border-yellow-400 bg-yellow-50' : 'border-slate-200 bg-slate-50'
                     }`}
                     key={box.id}
                   >
-                    <strong className="text-sm">#{index + 1}</strong>
+                    <strong className="text-sm">#{index + 1 + (brushBoxes.length > 0 ? 1 : 0)}</strong>
                     <button className="text-left text-sm text-slate-600" onClick={() => setSelectedBoxId(box.id)} type="button">
                       <b className={box.source === 'manual' ? 'text-orange-700' : 'text-blue-700'}>{box.source === 'manual' ? '수동 추가' : '자동 감지'}</b>
                       <span className="ml-2">
